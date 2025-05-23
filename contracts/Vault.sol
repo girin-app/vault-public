@@ -51,16 +51,21 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
-import "hardhat/console.sol";
 
 contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
     using EnumerableSet for EnumerableSet.UintSet;
 
     address public operator;
+    address public gateway;
 
     modifier onlyOperator() {
         require(msg.sender == operator, "Caller is not the operator");
+        _;
+    }
+
+    modifier onlyGateway() {
+        require(msg.sender == gateway, "Caller is not the gateway");
         _;
     }
 
@@ -130,17 +135,19 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
     event YieldMaxRateUpdated(uint256 newRate);
     event OperatorUpdated(address indexed previousOperator, address indexed newOperator);
     event DepositCapUpdated(uint256 newCap);
+    event GatewayUpdated(address indexed previousGateway, address indexed newGateway);
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
 
-    function initialize(address _token, address _treasury, address _operator, address _owner) public initializer {
+    function initialize(address _token, address _treasury, address _operator, address _owner, address _gateway) public initializer {
         require(_token != address(0), "Invalid token address");
         require(_treasury != address(0), "Invalid treasury address");
         require(_operator != address(0), "Invalid operator address");
         require(_owner != address(0), "Invalid owner address");
+        require(_gateway != address(0), "Invalid gateway address");
 
         __Pausable_init();
         __Ownable_init(_owner);
@@ -148,6 +155,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         token = _token;
         treasury = _treasury;
         operator = _operator;
+        gateway = _gateway;
         withdrawalDelay = 7;
         yieldMaxRate = 300;
         depositCap = type(uint256).max; 
@@ -158,6 +166,12 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         require(_operator != address(0), "Invalid operator address");
         emit OperatorUpdated(operator, _operator);
         operator = _operator;
+    }
+
+    function setGateway(address _gateway) external onlyOwner {
+        require(_gateway != address(0), "Invalid gateway address");
+        emit GatewayUpdated(gateway, _gateway);
+        gateway = _gateway;
     }
 
     // Owner functions (using OwnableUpgradeable's owner)
@@ -284,10 +298,18 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
     }
 
     function claim() external whenNotPaused {
-        (uint256 principalAmount, uint256 interestAmount) = getClaimableAmount(msg.sender);
+        _claim(msg.sender);
+    }
+
+    function claimBehalf(address user) external whenNotPaused onlyGateway {
+        _claim(user);
+    }
+
+    function _claim(address user) internal {
+        (uint256 principalAmount, uint256 interestAmount) = getClaimableAmount(user);
         require(principalAmount > 0 || interestAmount > 0, "No withdrawals to claim");
 
-        EnumerableSet.UintSet storage userIndices = userWithdrawIndices[msg.sender];
+        EnumerableSet.UintSet storage userIndices = userWithdrawIndices[user];
         uint256 length = userIndices.length();
 
         for (uint256 i = 0; i < length;) {
@@ -305,9 +327,9 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
 
         uint256 totalAmount = principalAmount + interestAmount;
         require(IERC20(token).balanceOf(address(this)) >= totalAmount, "Insufficient contract balance");
-        IERC20(token).safeTransfer(msg.sender, totalAmount);
+        IERC20(token).safeTransfer(user, totalAmount);
 
-        emit Claimed(msg.sender, principalAmount, interestAmount);
+        emit Claimed(user, principalAmount, interestAmount);
     }
 
     function getClaimableAmount(address user) public view returns (uint256 principal, uint256 interest) {
