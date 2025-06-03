@@ -49,6 +49,7 @@ import "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 
@@ -114,6 +115,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
 
     address public treasury;
     address public token;
+    uint8 public tokenDecimals;
 
     // Events
     event Deposited(address indexed user, uint256 amount, uint256 xAmount);
@@ -127,7 +129,6 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         uint256 releaseTime
     );
     event Claimed(address indexed user, uint256 principalAmount, uint256 interestAmount);
-    event Delegated(uint256 amount);
     event Undelegated(uint256 amount);
     event YieldUpdated(uint256 amount, uint256 totalInterest);
     event WithdrawalDelayUpdated(uint256 newDelay);
@@ -159,6 +160,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         withdrawalDelay = 7;
         yieldMaxRate = 300;
         depositCap = type(uint256).max; 
+        tokenDecimals = IERC20Metadata(_token).decimals();
     }
 
     // Role management functions
@@ -177,12 +179,13 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
     // Owner functions (using OwnableUpgradeable's owner)
     function setTreasury(address _treasury) external onlyOwner {
         require(_treasury != address(0), "Invalid address");
+        require(IERC20(token).balanceOf(_treasury) >= totalSupply + totalInterest, "Insufficient treasury balance");
         treasury = _treasury;
         emit TreasuryUpdated(_treasury);
     }
 
     function setYieldMaxRate(uint256 _rate) external onlyOwner {
-        require(_rate > 0, "Rate must be greater than 0");
+        require(_rate > 0 && _rate <= 10000, "Invalid rate");
         yieldMaxRate = _rate;
         emit YieldMaxRateUpdated(_rate);
     }
@@ -217,30 +220,20 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         emit Deposited(msg.sender, amount, xAmount);
     }
 
-    function delegate(uint256 amount) external onlyOwner whenNotPaused {
-        require(amount > 0, "Amount must be greater than 0");
-        require(amount <= IERC20(token).balanceOf(address(this)), "Insufficient contract balance");
-        require(amount <= totalSupply, "Amount exceeds total supply");
-
-        IERC20(token).safeTransfer(treasury, amount);
-        totalDelegatedBalance += amount;
-
-        emit Delegated(amount);
-    }
-
     function undelegate() external onlyOperator whenNotPaused {
         uint256 targetTimestamp = getTargetUndelegateTimestamp(block.timestamp);
         _undelegate(targetTimestamp);
     }
 
     function undelegate(uint256 timestamp) external onlyOwner whenNotPaused {
+        require(timestamp <= block.timestamp, "Invalid timestamp");
         uint256 targetTimestamp = getTargetUndelegateTimestamp(timestamp);
         _undelegate(targetTimestamp);
     }
 
     function _undelegate(uint256 targetTimestamp) private {
         require(!withdrawReleased[targetTimestamp], "Withdrawals already released for this unit");
-        require(withdrawPerDay[targetTimestamp] > 0, "No withdrawals to release for this unit");
+        require(withdrawPerDay[targetTimestamp] + withdrawInterestPerDay[targetTimestamp] > 0, "No withdrawals to release for this unit");
 
         uint256 principalAmount = withdrawPerDay[targetTimestamp];
         uint256 interestAmount = withdrawInterestPerDay[targetTimestamp];
@@ -263,8 +256,11 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         uint256 maxWithdrawAmount = userXBalance * (totalSupply + totalInterest) / totalXSupply;
         require(amount <= maxWithdrawAmount, "Insufficient balance");
 
-        uint256 xAmount = amount * totalXSupply / (totalSupply + totalInterest);
-        uint256 principalAmount = amount * totalSupply / (totalSupply + totalInterest);
+        uint256 xAmount = (amount * totalXSupply + totalSupply + totalInterest - 1) / (totalSupply + totalInterest);
+        uint256 calculatedPrincipal = amount * totalSupply / (totalSupply + totalInterest);
+        uint256 principalAmount = calculatedPrincipal > depositBalance[msg.sender] 
+            ? depositBalance[msg.sender] 
+            : calculatedPrincipal;
         uint256 interestAmount = amount - principalAmount;
 
         depositXBalance[msg.sender] -= xAmount;
@@ -275,7 +271,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         totalInterest -= interestAmount;
 
         uint256 currentTime = getTimeUnitStart(block.timestamp);
-        uint256 releaseTime = releaseTime(block.timestamp);
+        uint256 withdrawReleaseTime = releaseTime(block.timestamp);
 
         withdrawPerDay[currentTime] += principalAmount;
         withdrawInterestPerDay[currentTime] += interestAmount;
@@ -285,7 +281,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
                 user: msg.sender,
                 timestamp: block.timestamp,
                 unitTime: currentTime,
-                releaseTime: releaseTime,
+                releaseTime: withdrawReleaseTime,
                 principalAmount: principalAmount,
                 interestAmount: interestAmount,
                 released: false
@@ -294,7 +290,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
 
         userWithdrawIndices[msg.sender].add(requestId);
 
-        emit WithdrawRequested(msg.sender, amount, principalAmount, interestAmount, block.timestamp, currentTime, releaseTime);
+        emit WithdrawRequested(msg.sender, amount, principalAmount, interestAmount, block.timestamp, currentTime, withdrawReleaseTime);
     }
 
     function claim() external whenNotPaused {
@@ -449,6 +445,76 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         }
 
         return result;
+    }
+
+    function getUserPrincipal(address user) external view returns (uint256) {
+        return depositBalance[user];
+    }
+
+    function getUserTotalBalance(address user) external view returns (uint256) {
+        if (totalXSupply == 0) return 0;
+        return depositXBalance[user] * (totalSupply + totalInterest) / totalXSupply;
+    }
+
+    function getUserYield(address user) external view returns (uint256) {
+        uint256 totalBalance = this.getUserTotalBalance(user);
+        uint256 principal = depositBalance[user];
+        return totalBalance > principal ? totalBalance - principal : 0;
+    }
+
+    function getUserXBalance(address user) external view returns (uint256) {
+        return depositXBalance[user];
+    }
+
+    function getExchangeRate() external view returns (uint256) {
+        uint256 scaleFactor = 10 ** tokenDecimals;
+        if (totalXSupply == 0) return scaleFactor;
+        return (totalSupply + totalInterest) * scaleFactor / totalXSupply;
+    }
+
+    function getProtocolState() external view returns (
+        uint256 _totalSupply,
+        uint256 _totalInterest, 
+        uint256 _totalXSupply,
+        uint256 _exchangeRate
+    ) {
+        _totalSupply = totalSupply;
+        _totalInterest = totalInterest;
+        _totalXSupply = totalXSupply;
+        _exchangeRate = this.getExchangeRate();
+    }
+
+    function getUserInfo(address user) external view returns (
+        uint256 principal,
+        uint256 totalBalance,
+        uint256 yieldAmount,
+        uint256 xBalance
+    ) {
+        principal = depositBalance[user];
+        totalBalance = this.getUserTotalBalance(user);
+        yieldAmount = totalBalance > principal ? totalBalance - principal : 0;
+        xBalance = depositXBalance[user];
+    }
+
+    function getUsersInfo(address[] memory users) external view returns (
+        uint256[] memory principals,
+        uint256[] memory totalBalances,
+        uint256[] memory yieldAmounts,
+        uint256[] memory xBalances
+    ) {
+        principals = new uint256[](users.length);
+        totalBalances = new uint256[](users.length);
+        yieldAmounts = new uint256[](users.length);
+        xBalances = new uint256[](users.length);
+
+        for (uint256 i = 0; i < users.length; i++) {
+            principals[i] = depositBalance[users[i]];
+            totalBalances[i] = this.getUserTotalBalance(users[i]);
+            yieldAmounts[i] = totalBalances[i] > principals[i] ? totalBalances[i] - principals[i] : 0;
+            xBalances[i] = depositXBalance[users[i]];
+        }
+
+        return (principals, totalBalances, yieldAmounts, xBalances);
     }
 
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {}
