@@ -211,6 +211,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
 
         depositBalance[msg.sender] += amount;
         depositXBalance[msg.sender] += xAmount;
+        
         totalSupply += amount;
         totalXSupply += xAmount;
 
@@ -239,7 +240,6 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         uint256 interestAmount = withdrawInterestPerDay[targetTimestamp];
         uint256 totalAmount = principalAmount + interestAmount;
 
-        // Transfer tokens from treasury to this contract
         IERC20(token).safeTransferFrom(treasury, address(this), totalAmount);
         totalUndelegatedBalance += totalAmount;
 
@@ -253,20 +253,19 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         require(amount > 0, "Amount must be greater than 0");
 
         uint256 userXBalance = depositXBalance[msg.sender];
+        uint256 userDepositBalance = depositBalance[msg.sender];
+        
         uint256 maxWithdrawAmount = userXBalance * (totalSupply + totalInterest) / totalXSupply;
         require(amount <= maxWithdrawAmount, "Insufficient balance");
-
-        uint256 xAmount = (amount * totalXSupply + totalSupply + totalInterest - 1) / (totalSupply + totalInterest);
-        uint256 calculatedPrincipal = amount * totalSupply / (totalSupply + totalInterest);
-        uint256 principalAmount = calculatedPrincipal > depositBalance[msg.sender] 
-            ? depositBalance[msg.sender] 
-            : calculatedPrincipal;
+        
+        uint256 xAmountToBurn = (amount * totalXSupply + totalSupply + totalInterest - 1) / (totalSupply + totalInterest);
+        uint256 principalAmount = (amount * (totalXSupply * userDepositBalance)) / ((totalSupply + totalInterest) * userXBalance);
         uint256 interestAmount = amount - principalAmount;
-
-        depositXBalance[msg.sender] -= xAmount;
-        totalXSupply -= xAmount;
-
+        
+        depositXBalance[msg.sender] -= xAmountToBurn;
         depositBalance[msg.sender] -= principalAmount;
+        
+        totalXSupply -= xAmountToBurn;
         totalSupply -= principalAmount;
         totalInterest -= interestAmount;
 
@@ -275,6 +274,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
 
         withdrawPerDay[currentTime] += principalAmount;
         withdrawInterestPerDay[currentTime] += interestAmount;
+        
         uint256 requestId = withdrawRequests.length;
         withdrawRequests.push(
             WithdrawRequest({
