@@ -99,6 +99,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
     mapping(uint256 => bool) public yieldUpdatedForDay; // Track if yield was updated for a day
 
     struct WithdrawRequest {
+        uint256 id;
         address user;
         uint256 timestamp;
         uint256 unitTime;
@@ -121,6 +122,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
     event Deposited(address indexed user, uint256 amount, uint256 xAmount);
     event WithdrawRequested(
         address indexed user,
+        uint256 id,
         uint256 amount,
         uint256 principalAmount,
         uint256 interestAmount,
@@ -128,10 +130,9 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         uint256 unitTime,
         uint256 releaseTime
     );
-    event Claimed(address indexed user, uint256 principalAmount, uint256 interestAmount);
-    event Undelegated(uint256 amount);
+    event Claimed(address indexed user, uint256[] requestIds, uint256 principalAmount, uint256 interestAmount);
+    event Undelegated(uint256 amount, uint256 principalAmount, uint256 interestAmount, uint256 targetTimestamp);
     event YieldUpdated(uint256 amount, uint256 totalInterest);
-    event WithdrawalDelayUpdated(uint256 newDelay);
     event TreasuryUpdated(address newTreasury);
     event YieldMaxRateUpdated(uint256 newRate);
     event OperatorUpdated(address indexed previousOperator, address indexed newOperator);
@@ -246,7 +247,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         // Mark this unit's withdrawals as released
         withdrawReleased[targetTimestamp] = true;
 
-        emit Undelegated(totalAmount);
+        emit Undelegated(totalAmount, principalAmount, interestAmount, targetTimestamp);
     }
 
     function withdraw(uint256 amount) external whenNotPaused {
@@ -278,6 +279,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         uint256 requestId = withdrawRequests.length;
         withdrawRequests.push(
             WithdrawRequest({
+                id: requestId,
                 user: msg.sender,
                 timestamp: block.timestamp,
                 unitTime: currentTime,
@@ -290,55 +292,89 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
 
         userWithdrawIndices[msg.sender].add(requestId);
 
-        emit WithdrawRequested(msg.sender, amount, principalAmount, interestAmount, block.timestamp, currentTime, withdrawReleaseTime);
+        emit WithdrawRequested(msg.sender, requestId, amount, principalAmount, interestAmount, block.timestamp, currentTime, withdrawReleaseTime);
     }
 
     function claim() external whenNotPaused {
         _claim(msg.sender);
     }
 
+    function claim(uint256[] memory requestIds) external whenNotPaused {
+        require(requestIds.length > 0, "No request IDs provided");
+        _claim(msg.sender, requestIds);
+    }
+
     function claimBehalf(address user) external whenNotPaused onlyGateway {
         _claim(user);
     }
 
+    function _claim(address user, uint256[] memory requestIds) internal {
+        EnumerableSet.UintSet storage userIndices = userWithdrawIndices[user];
+
+        uint256 principalAmount = 0;
+        uint256 interestAmount = 0;
+        for (uint256 i = 0; i < requestIds.length; i++) {
+            uint256 requestId = requestIds[i];
+            require(requestId < withdrawRequests.length, "Invalid request ID");
+            WithdrawRequest storage request = withdrawRequests[requestId];
+            require(request.user == user, "Request does not belong to user");
+            require(!request.released, "Request already released");
+            require(request.releaseTime <= block.timestamp && withdrawReleased[request.unitTime], "Request not yet available for claim");
+            request.released = true;
+            principalAmount += request.principalAmount;
+            interestAmount += request.interestAmount;
+            userIndices.remove(requestId);
+        }
+        
+        require(principalAmount > 0 || interestAmount > 0, "No withdrawals to claim");
+        uint256 totalAmount = principalAmount + interestAmount;
+        require(IERC20(token).balanceOf(address(this)) >= totalAmount, "Insufficient contract balance");
+        IERC20(token).safeTransfer(user, totalAmount);
+
+        emit Claimed(user, requestIds, principalAmount, interestAmount);
+    }
+
     function _claim(address user) internal {
-        (uint256 principalAmount, uint256 interestAmount) = getClaimableAmount(user);
+        (uint256[] memory requestIds, uint256 principalAmount, uint256 interestAmount) = getClaimableAmount(user);
         require(principalAmount > 0 || interestAmount > 0, "No withdrawals to claim");
 
         EnumerableSet.UintSet storage userIndices = userWithdrawIndices[user];
-        uint256 length = userIndices.length();
 
-        for (uint256 i = 0; i < length;) {
-            uint256 requestId = userIndices.at(i);
+        for (uint256 i = 0; i < requestIds.length; i++) {
+            uint256 requestId = requestIds[i];
             WithdrawRequest storage request = withdrawRequests[requestId];
-
-            if (!request.released && request.releaseTime <= block.timestamp && withdrawReleased[request.unitTime]) {
-                request.released = true;
-                userIndices.remove(requestId);
-                length = userIndices.length();
-            } else {
-                i++;
-            }
+            request.released = true;
+            userIndices.remove(requestId);
         }
 
         uint256 totalAmount = principalAmount + interestAmount;
         require(IERC20(token).balanceOf(address(this)) >= totalAmount, "Insufficient contract balance");
         IERC20(token).safeTransfer(user, totalAmount);
 
-        emit Claimed(user, principalAmount, interestAmount);
+        emit Claimed(user, requestIds, principalAmount, interestAmount);
     }
 
-    function getClaimableAmount(address user) public view returns (uint256 principal, uint256 interest) {
+    function getClaimableAmount(address user) public view returns (uint256[] memory requestIds, uint256 principal, uint256 interest) {
         EnumerableSet.UintSet storage userIndices = userWithdrawIndices[user];
+        uint256[] memory tempRequestIds = new uint256[](userIndices.length());
+        uint256 count = 0;
 
         for (uint256 i = 0; i < userIndices.length(); i++) {
             WithdrawRequest storage request = withdrawRequests[userIndices.at(i)];
             if (!request.released && request.releaseTime <= block.timestamp && withdrawReleased[request.unitTime]) {
+                tempRequestIds[count] = request.id;
                 principal += request.principalAmount;
                 interest += request.interestAmount;
+                count++;
             }
         }
-        return (principal, interest);
+
+        requestIds = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            requestIds[i] = tempRequestIds[i];
+        }
+
+        return (requestIds, principal, interest);
     }
 
     function updateYield(uint256 amount) external onlyOperator whenNotPaused {
@@ -482,6 +518,14 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         _totalInterest = totalInterest;
         _totalXSupply = totalXSupply;
         _exchangeRate = this.getExchangeRate();
+    }
+
+    function getUsersYield(address[] memory users) external view returns (uint256[] memory yieldAmounts) {
+        yieldAmounts = new uint256[](users.length);
+        for (uint256 i = 0; i < users.length; i++) {
+            yieldAmounts[i] = this.getUserYield(users[i]);
+        }
+        return yieldAmounts;
     }
 
     function getUserInfo(address user) external view returns (
