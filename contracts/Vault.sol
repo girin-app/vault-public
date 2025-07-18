@@ -70,7 +70,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         _;
     }
 
-    uint256 public constant TIME_UNIT = 1 minutes; // dev/qa: 5 minutes, prod: 1 days
+    uint256 public constant TIME_UNIT = 1 days;
     uint256 public totalSupply;
     uint256 public totalInterest;
     uint256 public totalDelegatedBalance;
