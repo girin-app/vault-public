@@ -253,14 +253,13 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
     function withdraw(uint256 amount) external whenNotPaused {
         require(amount > 0, "Amount must be greater than 0");
 
-        uint256 userXBalance = depositXBalance[msg.sender];
         uint256 userDepositBalance = depositBalance[msg.sender];
+        uint256 userTotalBalance = getUserTotalBalance(msg.sender);
+        require(amount <= userTotalBalance, "Insufficient balance");
         
-        uint256 maxWithdrawAmount = userXBalance * (totalSupply + totalInterest) / totalXSupply;
-        require(amount <= maxWithdrawAmount, "Insufficient balance");
-        
+        uint256 principalAmount = amount * userDepositBalance / userTotalBalance;
+        principalAmount = principalAmount > amount ? amount : principalAmount;
         uint256 xAmountToBurn = (amount * totalXSupply + totalSupply + totalInterest - 1) / (totalSupply + totalInterest);
-        uint256 principalAmount = (amount * (totalXSupply * userDepositBalance)) / ((totalSupply + totalInterest) * userXBalance);
         uint256 interestAmount = amount - principalAmount;
         
         depositXBalance[msg.sender] -= xAmountToBurn;
@@ -487,7 +486,7 @@ contract Vault is Initializable, PausableUpgradeable, OwnableUpgradeable, UUPSUp
         return depositBalance[user];
     }
 
-    function getUserTotalBalance(address user) external view returns (uint256) {
+    function getUserTotalBalance(address user) public view returns (uint256) {
         if (totalXSupply == 0) return 0;
         return depositXBalance[user] * (totalSupply + totalInterest) / totalXSupply;
     }
